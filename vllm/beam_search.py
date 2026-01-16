@@ -99,29 +99,13 @@ def is_done_heuristic(
     tokenizer_eos_token_id: int | None = None,
     sort_beams_key: Callable[[BeamSearchSequence], float] | None = None,
 ) -> bool:
-    """
-    判断是否应停止 beam search。
-
-    实现原理：
-    - 确保至少生成 min_length 个 token 才能停止；
-    - 根据 early_stopping 模式不同使用不同的判断逻辑；
-    - 对于 early_stopping=True，会在“数量满足 + 质量差距明显”后停止；
-    - 对于 early_stopping="never"，仅在所有 beam 均结束或达到最大长度时停止；
-    - 对于 early_stopping=False，使用分数启发式判断。
-    """
-
-    # ---------- 基础检查 ----------
     if not instance.beams:
-        # 没有活跃 beam时，如果完成序列够多就可以停止
         return len(instance.completed) >= beam_width
 
-    # ---------- 长度逻辑 ----------
     generated_len = cur_len - prompt_len
     if generated_len < min_length:
-        # 生成长度未达阈值，不可停止
         return False
 
-    # ---------- 辅助函数 ----------
     def normalized_score(seq_or_beam) -> float:
         """计算长度惩罚后的归一化分数"""
         seq_len = len(seq_or_beam.tokens)
@@ -129,41 +113,31 @@ def is_done_heuristic(
             return seq_or_beam.cum_logprob
         return seq_or_beam.cum_logprob / (seq_len ** length_penalty)
 
-    # ---------- 模式：early_stopping=True ----------
     if early_stopping is True:
-        # 若未达到所需完成序列数，则继续
         if len(instance.completed) < beam_width:
             return False
 
-        # 达到最大长度 -> 停止
         if max_length is not None and cur_len >= max_length:
             return True
 
-        # 有活跃beam时，需比较质量差距
         if instance.completed and instance.beams:
             best_completed = max(normalized_score(seq) for seq in instance.completed)
             best_active = max(normalized_score(beam) for beam in instance.beams)
-            # 若活跃beam即使最乐观情况下也难超过完成序列，则终止
             if best_active <= best_completed:
                 return True
         return False
 
-    # ---------- 模式：early_stopping="never" ----------
     if early_stopping == "never":
-        # 达到最大长度 -> 停止
         if max_length is not None and cur_len >= max_length:
             return True
 
-        # 检查是否还有活跃beam未遇到EOS
         active_beams = [
             beam for beam in instance.beams
             if not beam.tokens or beam.tokens[-1] != tokenizer_eos_token_id
         ]
         if active_beams:
-            # 仍有活跃beam -> 不停止
             return False
 
-        # 所有beam已结束，比较分数是否还能找到更好结果
         if not instance.completed or tokenizer_eos_token_id is None:
             return False
 
@@ -171,8 +145,6 @@ def is_done_heuristic(
         worst_completed = min(normalized_score(seq) for seq in instance.completed)
         return best_active <= worst_completed
 
-    # ---------- 模式：early_stopping=False ----------
-    # 启发式停止，当活跃beam不太可能超过当前完成序列时终止
     if not instance.completed or tokenizer_eos_token_id is None:
         return False
 
