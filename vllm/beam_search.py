@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -86,3 +87,70 @@ def create_sort_beams_key_function(eos_token_id: int, length_penalty: float):
         )
 
     return sort_beams_key
+
+
+def is_done_heuristic(
+    instance: BeamSearchInstance,
+    beam_width: int,
+    early_stopping: bool | str,
+    length_penalty: float,
+    cur_len: int,
+    prompt_len: int = 0,
+    min_length: int = 0,
+    max_length: int | None = None,
+    tokenizer_eos_token_id: int | None = None,
+    sort_beams_key: Callable[[BeamSearchSequence], float] | None = None,
+) -> bool:
+    if not instance.beams:
+        return len(instance.completed) >= beam_width
+
+    generated_len = cur_len - prompt_len
+    if generated_len < min_length:
+        return False
+
+    def normalized_score(seq_or_beam) -> float:
+        """计算长度惩罚后的归一化分数"""
+        seq_len = len(seq_or_beam.tokens)
+        if length_penalty == 0.0:
+            return seq_or_beam.cum_logprob
+        return seq_or_beam.cum_logprob / (seq_len**length_penalty)
+
+    if early_stopping is True:
+        if len(instance.completed) < beam_width:
+            return False
+
+        if max_length is not None and cur_len >= max_length:
+            return True
+
+        if instance.completed and instance.beams:
+            best_completed = max(normalized_score(seq) for seq in instance.completed)
+            best_active = max(normalized_score(beam) for beam in instance.beams)
+            if best_active <= best_completed:
+                return True
+        return False
+
+    if early_stopping == "never":
+        if max_length is not None and cur_len >= max_length:
+            return True
+
+        active_beams = [
+            beam
+            for beam in instance.beams
+            if not beam.tokens or beam.tokens[-1] != tokenizer_eos_token_id
+        ]
+        if active_beams:
+            return False
+
+        if not instance.completed or tokenizer_eos_token_id is None:
+            return False
+
+        best_active = max(normalized_score(beam) for beam in instance.beams)
+        worst_completed = min(normalized_score(seq) for seq in instance.completed)
+        return best_active <= worst_completed
+
+    if not instance.completed or tokenizer_eos_token_id is None:
+        return False
+
+    worst_completed = min(normalized_score(seq) for seq in instance.completed)
+    best_active = max(normalized_score(beam) for beam in instance.beams)
+    return worst_completed >= best_active

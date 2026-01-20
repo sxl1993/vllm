@@ -16,6 +16,7 @@ from vllm.beam_search import (
     BeamSearchOutput,
     BeamSearchSequence,
     create_sort_beams_key_function,
+    is_done_heuristic,
 )
 from vllm.config import (
     AttentionConfig,
@@ -610,7 +611,11 @@ class LLM:
         temperature = params.temperature
         ignore_eos = params.ignore_eos
         length_penalty = params.length_penalty
+        early_stopping = params.early_stopping
 
+        min_tokens = getattr(params, "min_tokens", 0)
+        if min_tokens == 0 and max_tokens > 0:
+            min_tokens = max(5, int(max_tokens * 0.10))
         lora_requests = self._get_beam_search_lora_requests(lora_request, prompts)
 
         tokenizer = self.get_tokenizer()
@@ -648,7 +653,7 @@ class LLM:
             skip_clone=True,  # Internal beam search, safe to skip clone
         )
         instances: list[BeamSearchInstance] = []
-
+        prompt_lengths = []
         for lora_req, prompt in zip(lora_requests, prompts):
             # Add multimodal processor kwargs & data
             mm_kwargs = {}
@@ -662,6 +667,7 @@ class LLM:
                 prompt_tokens = prompt["prompt_token_ids"]
             else:
                 prompt_tokens = tokenizer.encode(prompt["prompt"])
+            prompt_lengths.append(len(prompt_tokens))
 
             instances.append(
                 BeamSearchInstance(
@@ -674,7 +680,9 @@ class LLM:
 
         for prompt_start in range(0, len(prompts), concurrency_limit):
             instances_batch = instances[prompt_start : prompt_start + concurrency_limit]
-
+            prompt_lengths_batch = prompt_lengths[
+                prompt_start : prompt_start + concurrency_limit
+            ]
             token_iter = range(max_tokens)
             if use_tqdm:
                 token_iter = tqdm(
@@ -686,9 +694,42 @@ class LLM:
                     "reflect instance-level progress."
                 )
             for _ in token_iter:
-                all_beams: list[BeamSearchSequence] = list(
-                    sum((instance.beams for instance in instances_batch), [])
-                )
+                active_instances = []
+                active_prompt_lengths = []
+                all_beams: list[BeamSearchSequence] = []
+                for instance, prompt_len in zip(instances_batch, prompt_lengths_batch):
+                    current_seq_len = 0
+                    if instance.beams:
+                        current_seq_len = len(instance.beams[0].tokens)
+                    elif instance.completed:
+                        current_seq_len = len(instance.completed[0].tokens)
+
+                    generated_tokens = current_seq_len - prompt_len
+                    if generated_tokens < min_tokens:
+                        if instance.beams:
+                            active_instances.append(instance)
+                            active_prompt_lengths.append(prompt_len)
+                            all_beams.extend(instance.beams)
+                        continue
+                    is_done = is_done_heuristic(
+                        instance=instance,
+                        beam_width=beam_width,
+                        early_stopping=early_stopping,
+                        length_penalty=length_penalty,
+                        cur_len=current_seq_len,
+                        prompt_len=prompt_len,
+                        min_length=min_tokens,
+                        max_length=max_tokens + prompt_len if max_tokens > 0 else None,
+                        tokenizer_eos_token_id=tokenizer.eos_token_id,
+                        sort_beams_key=sort_beams_key,
+                    )
+                    if not is_done and instance.beams:
+                        active_instances.append(instance)
+                        active_prompt_lengths.append(prompt_len)
+                        all_beams.extend(instance.beams)
+                if len(all_beams) == 0:
+                    break
+
                 pos = [0] + list(
                     itertools.accumulate(
                         len(instance.beams) for instance in instances_batch
@@ -718,10 +759,11 @@ class LLM:
                     lora_request=lora_req_batch,
                 )
 
-                for (start, end), instance in zip(
-                    instance_start_and_end, instances_batch
+                for (start, end), instance, prompt_len in zip(
+                    instance_start_and_end, active_instances, active_prompt_lengths
                 ):
                     instance_new_beams = []
+
                     for i in range(start, end):
                         current_beam = all_beams[i]
                         result = output[i]
@@ -743,10 +785,16 @@ class LLM:
                                     mm_processor_kwargs=current_beam.mm_processor_kwargs,
                                 )
 
-                                if (
+                                new_beam_generated_len = (
+                                    len(new_beam.tokens) - prompt_len
+                                )
+                                should_complete = (
                                     token_id == tokenizer.eos_token_id
                                     and not ignore_eos
-                                ):
+                                    and new_beam_generated_len >= min_tokens
+                                )
+
+                                if should_complete:
                                     instance.completed.append(new_beam)
                                 else:
                                     instance_new_beams.append(new_beam)
